@@ -1,0 +1,668 @@
+diff -ruN '--exclude=build-crosfp' patch-base/libfprint-1.94.7+tod1/libfprint/drivers/crosfp.c libfprint-1.94.7+tod1-minimal/libfprint/drivers/crosfp.c
+--- a/libfprint/drivers/crosfp.c	1970-01-01 01:00:00.000000000 +0100
++++ b/libfprint/drivers/crosfp.c	2026-09-16 14:56:06.782640951 +0200
+@@ -0,0 +1,499 @@
++/*
++ * crosfp.c — libfprint driver for the ChromeOS fingerprint sensor
++ *            (bloonchipper MCU / FPC sensor)
++ *
++ * Hardware: ACPI CRFP0000/0001, fingerprint MCU on the SPI bus, exposed by
++ *           the kernel cros-ec-spi / cros_ec_chardev drivers as /dev/cros_fp.
++ * Transport: CROS_EC_DEV_IOCXCMD (note: this kernel uses CROS_EC_DEV_IOC=0xec,
++ *            older kernels use 0x87) sends EC host commands directly.
++ * Events:   IOCEVENTMASK + poll/read subscription, same as ChromiumOS biod.
++ * Capture:  FP_MODE(SIMPLE_IMAGE) → wait for EC_MKBP_FP_IMAGE_READY →
++ *           chunked FP_FRAME reads. The driver exposes captured images to
++ *           libfprint; enrollment templates and matching are handled by
++ *           libfprint/fprintd on the host, not by ChromeOS biod.
++ *
++ * References: coolstar/crosfingerprint (Apache-2.0) cros_ec_* / wbdi.c,
++ *             ChromiumOS platform2/biod CrosFpDevice,
++ *             libfprint drivers/elanspi.c.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define FP_COMPONENT "crosfp"
++
++#include "drivers_api.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <math.h>
++#include <poll.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++/* ---------------- Kernel UAPI (this kernel: CROS_EC_DEV_IOC = 0xec) ---------------- */
++#define CROS_EC_DEV_IOC      0xec
++#define CROS_EC_DEV_IOCXCMD  _IOWR(CROS_EC_DEV_IOC, 0, struct cros_ec_command)
++#define CROS_EC_DEV_EVENTMASK 0xec02u
++
++struct cros_ec_command {
++  uint32_t version;
++  uint32_t command;
++  uint32_t outsize;
++  uint32_t insize;
++  uint32_t result;
++  uint8_t  data[];
++};
++
++/* ---------------- EC command numbers (ec_commands.h) ---------------- */
++#define EC_CMD_FP_MODE   0x0402
++#define EC_CMD_FP_FRAME  0x0404
++
++/* ---------------- FP flags ---------------- */
++#ifndef BIT
++#define BIT(n) (1UL << (n))
++#endif
++#define FP_MODE_FINGER_DOWN   BIT(1)
++#define FP_MODE_FINGER_UP     BIT(2)
++#define FP_MODE_CAPTURE       BIT(3)
++#define FP_MODE_CAPTURE_TYPE_SHIFT 28
++
++#define FP_FRAME_INDEX_RAW_IMAGE 0
++#define FP_FRAME_INDEX_SHIFT 28
++#define FP_FRAME_OFFSET_MASK 0x0FFFFFFF
++#define FP_CAPTURE_SIMPLE_IMAGE 1
++
++/* ---------------- MKBP events ---------------- */
++#define EC_MKBP_EVENT_TYPE_MASK   0x7F
++#define EC_MKBP_EVENT_FINGERPRINT 5
++#define EC_MKBP_FP_FINGER_DOWN    BIT(29)
++#define EC_MKBP_FP_FINGER_UP      BIT(30)
++#define EC_MKBP_FP_IMAGE_READY    BIT(31)
++
++/* ---------------- Image parameters (FP_INFO) ---------------- */
++#define CROSFP_IMG_W 160
++#define CROSFP_IMG_H 160
++#define CROSFP_IMG_SIZE (CROSFP_IMG_W * CROSFP_IMG_H)
++
++#define CROSFP_MAX_CHUNK 512
++#define CROSFP_TIMEOUT_MS 15000
++
++typedef struct _FpiDeviceCrosFp {
++  FpImageDevice parent;
++
++  int fd;
++} FpiDeviceCrosFp;
++
++G_DECLARE_FINAL_TYPE (FpiDeviceCrosFp, fpi_device_crosfp, FPI, DEVICE_CROSFP,
++                      FpImageDevice);
++G_DEFINE_TYPE (FpiDeviceCrosFp, fpi_device_crosfp, FP_TYPE_IMAGE_DEVICE)
++
++/* ---------------- EC transport ---------------- */
++static long
++ec_xfer (FpiDeviceCrosFp *self,
++         uint32_t          version,
++         uint32_t          cmd,
++         const void       *out,
++         uint32_t          outsize,
++         void             *in,
++         uint32_t          insize)
++{
++  uint8_t buf[20 + CROSFP_MAX_CHUNK];
++  struct cros_ec_command *c = (struct cros_ec_command *) buf;
++
++  if (outsize > CROSFP_MAX_CHUNK || insize > CROSFP_MAX_CHUNK)
++    return -E2BIG;
++
++  memset (buf, 0, sizeof (buf));
++  c->version = version;
++  c->command = cmd;
++  c->outsize = outsize;
++  c->insize = insize;
++  if (outsize)
++    memcpy (buf + 20, out, outsize);
++
++  long ret = ioctl (self->fd, CROS_EC_DEV_IOCXCMD, buf);
++  if (ret < 0)
++    return -errno;
++  if (c->result != 0)
++    return -EIO;
++  if (in && ret > 0) {
++    uint32_t n = (uint32_t) ret < insize ? (uint32_t) ret : insize;
++    memcpy (in, buf + 20, n);
++  }
++  return ret;
++}
++
++/* ---------------- State machine ---------------- */
++enum {
++  CROSFP_STATE_INIT,
++  CROSFP_STATE_CAPTURE,
++  CROSFP_STATE_FINISH,
++  CROSFP_NSTATES,
++};
++
++static void
++crosfp_capture (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceCrosFp *self = FPI_DEVICE_CROSFP (dev);
++
++  switch (fpi_ssm_get_cur_state (ssm)) {
++  case CROSFP_STATE_INIT:
++    {
++      /* Drain stale events left over from a previous capture (e.g. after
++       * a retry with the finger still down), so they cannot confuse the
++       * new capture round. */
++      struct pollfd dpfd = { .fd = self->fd, .events = POLLIN };
++      while (poll (&dpfd, 1, 0) > 0 && (dpfd.revents & POLLIN)) {
++        uint8_t dev_ev[8];
++        if (read (self->fd, dev_ev, sizeof (dev_ev)) < 5)
++          break;
++      }
++
++      struct { uint32_t mode; } p = {
++        FP_MODE_CAPTURE | FP_MODE_FINGER_DOWN | FP_MODE_FINGER_UP |
++        ((uint32_t) FP_CAPTURE_SIMPLE_IMAGE << FP_MODE_CAPTURE_TYPE_SHIFT)
++      };
++      uint32_t rmode = 0;
++      long r = ec_xfer (self, 0, EC_CMD_FP_MODE, &p, sizeof (p), &rmode, 4);
++      if (r < 0) {
++        fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
++                                               "FP_MODE failed: %s",
++                                               strerror (-r)));
++        return;
++      }
++      fp_dbg ("capture mode set");
++      fpi_ssm_next_state (ssm);
++    }
++    break;
++
++  case CROSFP_STATE_CAPTURE:
++    {
++      /* Short-timeout poll. IMPORTANT: when no event is pending we must
++       * NOT jump back synchronously — fpi_ssm_jump_to_state re-enters the
++       * handler immediately, which would spin in a blocking loop and starve
++       * the GLib main loop (fprintd would stop servicing D-Bus, freezing
++       * enroll and PAM authentication). Use the delayed variant instead:
++       * it schedules a timer and returns control to the main loop. */
++      struct pollfd pfd = { .fd = self->fd, .events = POLLIN };
++      int pr = poll (&pfd, 1, 50);
++      if (pr < 0) {
++        fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
++                                               "poll failed: %s",
++                                               strerror (errno)));
++        return;
++      }
++      if (pr == 0) {
++        fpi_ssm_jump_to_state_delayed (ssm, CROSFP_STATE_CAPTURE, 50);
++        return;
++      }
++      if (!(pfd.revents & POLLIN)) {
++        fpi_ssm_jump_to_state_delayed (ssm, CROSFP_STATE_CAPTURE, 50);
++        return;
++      }
++
++      uint8_t ev[8];
++      ssize_t n = read (self->fd, ev, sizeof (ev));
++      if (n < 5) {
++        fpi_ssm_jump_to_state_delayed (ssm, CROSFP_STATE_CAPTURE, 50);
++        return;
++      }
++      uint8_t type = ev[0] & EC_MKBP_EVENT_TYPE_MASK;
++      if (type != EC_MKBP_EVENT_FINGERPRINT) {
++        fpi_ssm_jump_to_state_delayed (ssm, CROSFP_STATE_CAPTURE, 50);
++        return;
++      }
++
++      uint32_t fp_events;
++      memcpy (&fp_events, ev + 1, 4);
++      fp_dbg ("fp_events = 0x%08x", fp_events);
++
++      if (fp_events & EC_MKBP_FP_IMAGE_READY) {
++        /* Image ready: synchronously move the framework into the CAPTURE
++         * state, then proceed to fetch the frame. */
++        fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
++        fpi_ssm_next_state (ssm);
++      } else if (fp_events & EC_MKBP_FP_FINGER_DOWN) {
++        /* Finger down but image not ready yet: keep waiting. */
++        fpi_ssm_jump_to_state_delayed (ssm, CROSFP_STATE_CAPTURE, 50);
++      } else if (fp_events & EC_MKBP_FP_FINGER_UP) {
++        /* Finger up: ignore, keep waiting. */
++        fpi_ssm_jump_to_state_delayed (ssm, CROSFP_STATE_CAPTURE, 50);
++      } else {
++        /* Other events: keep waiting. */
++        fpi_ssm_jump_to_state_delayed (ssm, CROSFP_STATE_CAPTURE, 50);
++      }
++    }
++    break;
++
++  case CROSFP_STATE_FINISH:
++    {
++      uint8_t *img = g_malloc0 (CROSFP_IMG_SIZE);
++      uint32_t offset = 0;
++
++      while (offset < CROSFP_IMG_SIZE) {
++        uint32_t remain = CROSFP_IMG_SIZE - offset;
++        uint32_t want = remain < CROSFP_MAX_CHUNK ? remain : CROSFP_MAX_CHUNK;
++        struct { uint32_t offset; uint32_t size; } p = {
++          (FP_FRAME_INDEX_RAW_IMAGE << FP_FRAME_INDEX_SHIFT) &
++            FP_FRAME_OFFSET_MASK,
++          want
++        };
++        long r = ec_xfer (self, 0, EC_CMD_FP_FRAME, &p, sizeof (p),
++                          img + offset, want);
++        if (r < 0) {
++          g_free (img);
++          fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
++                                                 "FP_FRAME failed: %s",
++                                                 strerror (-r)));
++          return;
++        }
++        if ((uint32_t) r != want) {
++          g_free (img);
++          fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
++                                                 "short frame read (%ld/%u)",
++                                                 r, want));
++          return;
++        }
++        offset += want;
++      }
++
++      /* ---- Quality check ----
++       * Measured sensor profile (Redrix, FPC 0x021f):
++       *   - no contact: ~255 (saturated)
++       *   - ridge contact: 79..175
++       * A frame where most pixels are saturated means the finger only
++       * covers a small part of the 160x160 window; enrolling such a frame
++       * poisons the template and kills match rates. Two gates:
++       *   1. coverage: fraction of non-saturated pixels (must be >= 30%)
++       *   2. contrast: min/max span and stddev (must show ridge detail)
++       */
++      {
++        uint8_t min = 255, max = 0;
++        double sum = 0, sum2 = 0;
++        uint32_t active = 0;   /* pixels below the saturation floor */
++        for (uint32_t i = 0; i < CROSFP_IMG_SIZE; i++) {
++          uint8_t v = img[i];
++          if (v < min) min = v;
++          if (v > max) max = v;
++          if (v < 240)
++            active++;
++          sum += v;
++          sum2 += (double) v * v;
++        }
++        double mean = sum / CROSFP_IMG_SIZE;
++        double variance = sum2 / CROSFP_IMG_SIZE - mean * mean;
++        double stddev = variance > 0 ? sqrt (variance) : 0;
++        double coverage = 100.0 * active / CROSFP_IMG_SIZE;
++        fp_dbg ("frame quality: min=%u max=%u mean=%.1f stddev=%.1f "
++                "coverage=%.1f%%", min, max, mean, stddev, coverage);
++
++        if (coverage < 30.0) {
++          /* Finger covers too little of the sensor window. */
++          g_free (img);
++          fp_dbg ("low coverage frame, requesting retry");
++          fpi_image_device_retry_scan (FP_IMAGE_DEVICE (dev),
++                                       FP_DEVICE_RETRY_CENTER_FINGER);
++          /* retry_scan() moved the framework to AWAIT_FINGER_OFF; report
++           * the finger as gone so it returns to IDLE and the next capture
++           * can start. Without this the framework waits forever. */
++          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev),
++                                                 FALSE);
++          fpi_ssm_mark_completed (ssm);
++          return;
++        }
++        if (max - min < 24 || stddev < 8.0) {
++          /* Nearly flat frame: no usable ridge contrast. */
++          g_free (img);
++          fp_dbg ("low-contrast frame, requesting retry");
++          fpi_image_device_retry_scan (FP_IMAGE_DEVICE (dev),
++                                       FP_DEVICE_RETRY_GENERAL);
++          fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev),
++                                                 FALSE);
++          fpi_ssm_mark_completed (ssm);
++          return;
++        }
++      }
++
++      /* ---- Contrast normalization (min-max stretch) ----
++       * The sensor's raw dynamic range is narrow (e.g. 97..205 on a good
++       * press). Stretch it to the full 0..255 range so the nbis engine
++       * sees proper ridge/valley contrast.
++       */
++      {
++        uint8_t min = 255, max = 0;
++        for (uint32_t i = 0; i < CROSFP_IMG_SIZE; i++) {
++          uint8_t v = img[i];
++          if (v < min) min = v;
++          if (v > max) max = v;
++        }
++        int range = max - min;
++        if (range > 0) {
++          for (uint32_t i = 0; i < CROSFP_IMG_SIZE; i++) {
++            img[i] = (uint8_t) ((img[i] - min) * 255 / range);
++          }
++        }
++      }
++
++      FpImage *fpi_img = fp_image_new (CROSFP_IMG_W, CROSFP_IMG_H);
++      memcpy (fpi_img->data, img, CROSFP_IMG_SIZE);
++      g_free (img);
++
++      /* ---- Upscale 2x before submission (same as elanspi/egis0570) ----
++       * The nbis Gabor filters work at a fixed pixel scale; a 160x160
++       * window undersamples the ridges and yields too few minutiae.
++       * Doubling the image brings the ridge spacing into the range the
++       * engine expects and measurably improves match rates on small
++       * sensors (see freedesktop bug 62749).
++       */
++      {
++        FpImage *scaled = fpi_image_resize (fpi_img, 2, 2);
++        if (scaled != fpi_img)
++          g_clear_object (&fpi_img);
++        fpi_img = scaled;
++      }
++
++      fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), fpi_img);
++      /* Tell the framework the finger is gone (back to IDLE). */
++      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
++      fpi_ssm_mark_completed (ssm);
++    }
++    break;
++
++  default:
++    fpi_ssm_mark_completed (ssm);
++    break;
++  }
++}
++
++static void
++crosfp_capture_finish (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
++
++  G_DEBUG_HERE ();
++
++  if (error)
++    fpi_image_device_session_error (idev, error);
++}
++
++/* ---------------- Device callbacks ---------------- */
++static void
++crosfp_dev_init (FpImageDevice *dev)
++{
++  FpiDeviceCrosFp *self = FPI_DEVICE_CROSFP (dev);
++  GError *error = NULL;
++
++  self->fd = -1;
++
++  const char *path = fpi_device_get_udev_data (FP_DEVICE (dev),
++                                               FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
++  if (!path) {
++    g_set_error (&error, G_IO_ERROR, G_IO_ERROR_FAILED,
++                 "no udev device path");
++    fpi_image_device_open_complete (dev, error);
++    return;
++  }
++
++  fp_dbg ("opening %s", path);
++  self->fd = open (path, O_RDWR);
++  if (self->fd < 0) {
++    g_set_error (&error, G_IO_ERROR, g_io_error_from_errno (errno),
++                 "unable to open %s", path);
++    fpi_image_device_open_complete (dev, error);
++    return;
++  }
++
++  fpi_image_device_open_complete (dev, NULL);
++}
++
++static void
++crosfp_dev_deinit (FpImageDevice *dev)
++{
++  FpiDeviceCrosFp *self = FPI_DEVICE_CROSFP (dev);
++
++  if (self->fd >= 0) {
++    close (self->fd);
++    self->fd = -1;
++  }
++  fpi_image_device_close_complete (dev, NULL);
++}
++
++static void
++crosfp_dev_activate (FpImageDevice *dev)
++{
++  FpiDeviceCrosFp *self = FPI_DEVICE_CROSFP (dev);
++  unsigned long mask = 1UL << EC_MKBP_EVENT_FINGERPRINT;
++
++  G_DEBUG_HERE ();
++
++  if (ioctl (self->fd, CROS_EC_DEV_EVENTMASK, mask) < 0)
++    fp_dbg ("IOCEVENTMASK failed: %s", strerror (errno));
++
++  fpi_image_device_activate_complete (dev, NULL);
++}
++
++static void
++crosfp_dev_deactivate (FpImageDevice *dev)
++{
++  fpi_image_device_deactivate_complete (dev, NULL);
++}
++
++static void
++crosfp_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
++{
++  if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON) {
++    FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), crosfp_capture,
++                               CROSFP_NSTATES);
++    fpi_ssm_start (ssm, crosfp_capture_finish);
++  }
++}
++
++static void
++fpi_device_crosfp_init (FpiDeviceCrosFp *self)
++{
++  self->fd = -1;
++}
++
++static void
++fpi_device_crosfp_class_init (FpiDeviceCrosFpClass *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
++
++  static const FpIdEntry crosfp_id_table[] = {
++    /* Devices whose sysfs path contains spi-PRP0001:00 or spi-PRP0001:01
++       * (libfprint
++       * matches with strstr). */
++    { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_SPIDEV,
++      .spi_acpi_id = "PRP0001:00",
++      .driver_data = 0 },
++    { .udev_types = FPI_DEVICE_UDEV_SUBTYPE_SPIDEV,
++      .spi_acpi_id = "PRP0001:01",
++      .driver_data = 0 },
++    { .udev_types = 0 }
++  };
++
++  dev_class->id = "crosfp";
++  dev_class->full_name = "ChromeOS Fingerprint Sensor (bloonchipper)";
++  dev_class->type = FP_DEVICE_TYPE_UDEV;
++  dev_class->id_table = crosfp_id_table;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  /* More stages = a template that covers more of the finger. The sensor is
++   * small (160x160), so extra coverage noticeably improves match rates. */
++  dev_class->nr_enroll_stages = 8;
++
++  img_class->img_height = CROSFP_IMG_H;
++  img_class->img_width = CROSFP_IMG_W;
++  img_class->bz3_threshold = 24;
++
++  img_class->img_open = crosfp_dev_init;
++  img_class->img_close = crosfp_dev_deinit;
++  img_class->activate = crosfp_dev_activate;
++  img_class->deactivate = crosfp_dev_deactivate;
++  img_class->change_state = crosfp_dev_change_state;
++}
+diff -ruN '--exclude=build-crosfp' patch-base/libfprint-1.94.7+tod1/libfprint/fp-context.c libfprint-1.94.7+tod1-minimal/libfprint/fp-context.c
+--- a/libfprint/fp-context.c	2024-02-20 08:58:28.000000000 +0100
++++ b/libfprint/fp-context.c	2026-09-16 13:01:31.257805389 +0200
+@@ -27,7 +27,7 @@
+ 
+ #include <config.h>
+ 
+-#ifdef HAVE_LIBFPRINT_TOD
++#if HAVE_LIBFPRINT_TOD
+ #include "tod/tod-shared-loader.h"
+ #endif
+ 
+@@ -300,7 +300,9 @@
+     g_object_run_dispose (G_OBJECT (priv->usb_ctx));
+   g_clear_object (&priv->usb_ctx);
+ 
++#if HAVE_LIBFPRINT_TOD
+   tod_shared_drivers_unregister ();
++#endif
+ 
+   G_OBJECT_CLASS (fp_context_parent_class)->finalize (object);
+ }
+@@ -365,9 +367,11 @@
+ 
+   priv->drivers = fpi_get_driver_types ();
+ 
++#if HAVE_LIBFPRINT_TOD
+   tod_shared_drivers_register ();
+   shared_drivers = tod_shared_drivers_get ();
+   g_array_prepend_vals (priv->drivers, shared_drivers->data, shared_drivers->len);
++#endif
+ 
+   if (get_drivers_allowlist_env ())
+     {
+@@ -490,6 +494,7 @@
+ 
+     g_autoptr(GList) spidev_devices = g_udev_client_query_by_subsystem (udev_client, "spidev");
+     g_autoptr(GList) hidraw_devices = g_udev_client_query_by_subsystem (udev_client, "hidraw");
++    g_autoptr(GList) misc_devices = g_udev_client_query_by_subsystem (udev_client, "misc");
+ 
+     /* for each potential driver, try to match all requested resources. */
+     for (i = 0; i < priv->drivers->len; i++)
+@@ -503,7 +508,7 @@
+ 
+         for (entry = cls->id_table; entry->udev_types; entry++)
+           {
+-            GList *matched_spidev = NULL, *matched_hidraw = NULL;
++            GList *matched_spidev = NULL, *matched_hidraw = NULL, *matched_misc = NULL;
+ 
+             if (entry->udev_types & FPI_DEVICE_UDEV_SUBTYPE_SPIDEV)
+               {
+@@ -517,7 +522,20 @@
+                   }
+                 /* If match was not found exit */
+                 if (matched_spidev == NULL)
+-                  continue;
++                  {
++                    for (matched_misc = misc_devices; matched_misc; matched_misc = matched_misc->next)
++                      {
++                        const gchar *sysfs = g_udev_device_get_sysfs_path (matched_misc->data);
++                        const gchar *device_file = g_udev_device_get_device_file (matched_misc->data);
++                        if (!sysfs || !device_file)
++                          continue;
++                        if (g_str_has_suffix (device_file, "/cros_fp") &&
++                            strstr (sysfs, entry->spi_acpi_id))
++                          break;
++                      }
++                    if (matched_misc == NULL)
++                      continue;
++                  }
+               }
+             if (entry->udev_types & FPI_DEVICE_UDEV_SUBTYPE_HIDRAW)
+               {
+@@ -548,7 +566,8 @@
+                                         async_device_init_done_cb,
+                                         context,
+                                         "fpi-driver-data", entry->driver_data,
+-                                        "fpi-udev-data-spidev", (matched_spidev ? g_udev_device_get_device_file (matched_spidev->data) : NULL),
++                                        "fpi-udev-data-spidev", (matched_spidev ? g_udev_device_get_device_file (matched_spidev->data) :
++                                                                 (matched_misc ? g_udev_device_get_device_file (matched_misc->data) : NULL)),
+                                         "fpi-udev-data-hidraw", (matched_hidraw ? g_udev_device_get_device_file (matched_hidraw->data) : NULL),
+                                         NULL);
+             /* remove entries from list to avoid conflicts */
+@@ -562,12 +581,18 @@
+                 g_object_unref (matched_hidraw->data);
+                 hidraw_devices = g_list_delete_link (hidraw_devices, matched_hidraw);
+               }
++            if (matched_misc)
++              {
++                g_object_unref (matched_misc->data);
++                misc_devices = g_list_delete_link (misc_devices, matched_misc);
++              }
+           }
+       }
+ 
+     /* free all unused elemnts in both lists */
+     g_list_foreach (spidev_devices, (GFunc) g_object_unref, NULL);
+     g_list_foreach (hidraw_devices, (GFunc) g_object_unref, NULL);
++    g_list_foreach (misc_devices, (GFunc) g_object_unref, NULL);
+   }
+ #endif
+ 
+diff -ruN '--exclude=build-crosfp' patch-base/libfprint-1.94.7+tod1/libfprint/meson.build libfprint-1.94.7+tod1-minimal/libfprint/meson.build
+--- a/libfprint/meson.build	2026-09-16 14:55:07.000000000 +0200
++++ b/libfprint/meson.build	2026-09-16 12:55:39.830976713 +0200
+@@ -131,6 +131,8 @@
+         [ 'drivers/elanmoc/elanmoc.c' ],
+     'elanspi' :
+         [ 'drivers/elanspi.c' ],
++    'crosfp' :
++        [ 'drivers/crosfp.c' ],
+     'nb1010' :
+         [ 'drivers/nb1010.c' ],
+     'virtual_image' :
+@@ -162,6 +164,8 @@
+         [ ],
+     'udev' :
+         [ ],
++    'pixman' :
++        [ ],
+     'virtual' :
+         [ 'drivers/virtual-device-listener.c' ],
+ }
+diff -ruN '--exclude=build-crosfp' patch-base/libfprint-1.94.7+tod1/meson.build libfprint-1.94.7+tod1-minimal/meson.build
+--- a/meson.build	2026-09-16 14:55:07.000000000 +0200
++++ b/meson.build	2026-09-16 12:55:39.829976705 +0200
+@@ -136,6 +136,7 @@
+     'fpcmoc',
+     'realtek',
+     'focaltech_moc',
++    'crosfp',
+ 
+     # SPI
+     'elanspi',
+@@ -156,6 +157,7 @@
+     'elanmoc',
+     'etes603',
+     'focaltech_moc',
++    'crosfp',
+     'nb1010',
+     'realtek',
+     'synaptics',
+@@ -188,6 +190,7 @@
+     'aes4000' : [ 'aeslib', 'aes3k' ],
+     'uru4000' : [ 'nss' ],
+     'elanspi' : [ 'udev' ],
++    'crosfp' : [ 'udev', 'pixman' ],
+     'virtual_image'          : [ 'virtual' ],
+     'virtual_device'         : [ 'virtual' ],
+     'virtual_device_storage' : [ 'virtual' ],
+@@ -250,6 +253,14 @@
+         endif
+ 
+         optional_deps += nss_dep
++    elif i == 'pixman'
++        imaging_dep = dependency('pixman-1', required: false)
++        if not imaging_dep.found()
++            error('pixman is required for @0@ and possibly others'.format(driver))
++        endif
++
++        libfprint_conf.set10('HAVE_PIXMAN', true)
++        optional_deps += imaging_dep
+     elif i == 'udev'
+         install_udev_rules = true
+ 

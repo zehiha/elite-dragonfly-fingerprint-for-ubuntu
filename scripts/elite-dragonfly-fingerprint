@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LIB_DIR="/usr/lib/elite-dragonfly-fingerprint"
+OVERRIDE_DIR="/etc/systemd/system/fprintd.service.d"
+OVERRIDE_FILE="$OVERRIDE_DIR/50-elite-dragonfly-fingerprint.conf"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  elite-dragonfly-fingerprint status
+  sudo elite-dragonfly-fingerprint enable
+  sudo elite-dragonfly-fingerprint disable
+
+This only controls the fprintd library override. It does not enroll fingers and
+does not edit PAM.
+USAGE
+}
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "This command needs root. Re-run with sudo." >&2
+    exit 1
+  fi
+}
+
+status() {
+  echo "Bundled library:"
+  ls -l "$LIB_DIR"/libfprint-2.so* 2>/dev/null || true
+  echo
+  echo "fprintd override:"
+  if [ -f "$OVERRIDE_FILE" ]; then
+    cat "$OVERRIDE_FILE"
+  else
+    echo "not enabled"
+  fi
+  echo
+  systemctl --no-pager --full status fprintd.service 2>&1 || true
+  echo
+  fprintd-list "${SUDO_USER:-$USER}" 2>&1 || true
+}
+
+enable_override() {
+  need_root
+  if [ ! -e "$LIB_DIR/libfprint-2.so.2" ]; then
+    echo "Bundled libfprint is missing: $LIB_DIR/libfprint-2.so.2" >&2
+    exit 1
+  fi
+
+  install -d -m 0755 "$OVERRIDE_DIR"
+  cat > "$OVERRIDE_FILE" <<EOF
+[Service]
+Environment=LD_LIBRARY_PATH=$LIB_DIR
+EOF
+  systemctl daemon-reload
+  systemctl restart fprintd.service || true
+  echo "Enabled fprintd libfprint override."
+  echo "Run: fprintd-list \"\$USER\""
+}
+
+disable_override() {
+  need_root
+  if [ -f "$OVERRIDE_FILE" ]; then
+    mv "$OVERRIDE_FILE" "$OVERRIDE_FILE.disabled-$(date +%Y%m%d-%H%M%S)"
+  fi
+  systemctl daemon-reload
+  systemctl restart fprintd.service || true
+  echo "Disabled fprintd libfprint override."
+}
+
+case "${1:-}" in
+  status)
+    status
+    ;;
+  enable)
+    enable_override
+    ;;
+  disable)
+    disable_override
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
